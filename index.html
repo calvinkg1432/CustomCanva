@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>互動解題白板 (可雙向延伸畫布版 + 兩指滾動)</title>
+    <style>
+        body, html { margin: 0; padding: 0; overflow-y: auto; overflow-x: hidden; background-color: #f0f0f0; font-family: sans-serif; }
+        
+        /* 確保背景圖保持在最上方，新增 transition 讓位移時平滑些 */
+        #bg-image { position: absolute; top: 0px; left: 0; width: 100vw; object-fit: contain; z-index: 1; pointer-events: none; }
+        
+        #drawing-board { position: absolute; top: 0; left: 0; z-index: 2; cursor: crosshair; touch-action: none; }
+        #ui-layer { position: absolute; top: 0; left: 0; z-index: 3; pointer-events: none; touch-action: none; }
+        
+        .toolbar { position: fixed; left: 20px; top: 50%; transform: translateY(-50%); z-index: 9999; display: flex; flex-direction: column; gap: 10px; background: white; padding: 10px; border-radius: 30px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); pointer-events: auto; touch-action: none; }
+        button { width: 50px; height: 50px; border-radius: 50%; border: 1px solid #ddd; background: #fff; cursor: pointer; font-size: 20px; display: flex; align-items: center; justify-content: center; pointer-events: auto; }
+        button.active { background: #e0e0e0; box-shadow: inset 0 2px 4px rgba(0,0,0,0.2); border: 2px solid #666; }
+        
+        .color-btn { width: 30px; height: 30px; border-radius: 50%; margin: 5px auto; border: 3px solid transparent; cursor: pointer; pointer-events: auto; }
+        .color-btn.active { border-color: #000; box-shadow: 0 0 5px rgba(0,0,0,0.5); }
+    </style>
+</head>
+<body>
+    <img id="bg-image" src="../images/ch1-1.png" alt="題目">
+    <canvas id="drawing-board"></canvas>
+    <canvas id="ui-layer"></canvas>
+
+    <div class="toolbar" id="tool-panel">
+        <button id="btn-undo" title="復原上一筆">↩️</button>
+        <div style="width:100%; height:1px; background:#ccc; margin:5px 0;"></div>
+        
+        <button id="btn-pen" class="active" title="畫筆">✏️</button>
+        <button id="btn-eraser" title="橡皮擦">🧼</button>
+        <button id="btn-move" title="框選移動">✂️</button>
+        
+        <div style="width:100%; height:1px; background:#ccc; margin:5px 0;"></div>
+        <div class="color-btn active" style="background: blue;" data-color="blue"></div>
+        <div class="color-btn" style="background: red;" data-color="red"></div>
+        <div class="color-btn" style="background: green;" data-color="green"></div>
+        <div style="width:100%; height:1px; background:#ccc; margin:5px 0;"></div>
+        
+        <!-- 雙向延伸按鈕 -->
+        <button id="btn-extend-up" title="向上延伸畫布">🔼</button>
+        <button id="btn-extend-down" title="向下延伸畫布">🔽</button>
+        <div style="width:100%; height:1px; background:#ccc; margin:5px 0;"></div>
+        
+        <button id="btn-save" title="儲存筆跡">💾</button>
+        <button id="btn-clear" title="清除全部">🗑️</button>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('drawing-board');
+        const ctx = canvas.getContext('2d');
+        const uiCanvas = document.getElementById('ui-layer');
+        const uiCtx = uiCanvas.getContext('2d');
+        const bgImg = document.getElementById('bg-image');
+        
+        const storageKey = 'board_state_' + window.location.pathname;
+        
+        let isDrawing = false;
+        let currentMode = 'pen';
+        let currentColor = 'blue';
+        let bgOffsetY = 0;
+
+        let undoStack = [];
+        let undoIndex = -1;
+        const maxUndoSteps = 20;
+
+        let selection = {
+            active: false, isSelecting: false, isDragging: false,
+            startX: 0, startY: 0, x: 0, y: 0, w: 0, h: 0, tempCanvas: null
+        };
+
+        // 兩指滾動變數
+        let activePointers = new Map();
+        let isPanning = false;
+        let lastPanX = 0, lastPanY = 0;
+
+        function initCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = Math.max(window.innerHeight * 1.5, window.innerHeight);
+            uiCanvas.width = canvas.width;
+            uiCanvas.height = canvas.height;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            loadCanvas(); 
+        }
+        initCanvas();
+
+        function saveState() {
+            undoIndex++;
+            undoStack.splice(undoIndex);
+            undoStack.push(canvas.toDataURL());
+            if (undoStack.length > maxUndoSteps) { undoStack.shift(); undoIndex--; }
+        }
+
+        document.getElementById('btn-undo').onpointerdown = function(e) {
+            e.stopPropagation();
+            if (selection.active) stampSelection(); 
+            if (undoIndex > 0) {
+                undoIndex--;
+                restoreFromDataURL(undoStack[undoIndex]);
+            } else if (undoIndex === 0) {
+                undoIndex--;
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+            }
+        };
+
+        function restoreFromDataURL(dataUrl, yOffset = 0) {
+            const img = new Image();
+            img.onload = () => {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(img, 0, yOffset);
+            };
+            img.src = dataUrl;
+        }
+
+        canvas.addEventListener('touchstart', function(e) { e.preventDefault(); }, { passive: false });
+        canvas.addEventListener('touchmove', function(e) { e.preventDefault(); }, { passive: false });
+
+        canvas.addEventListener('pointerdown', function(e) {
+            activePointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+            
+            // 偵測到兩指：進入滾動模式，強制中斷畫筆或框選
+            if (activePointers.size === 2) {
+                if(isDrawing) { isDrawing = false; ctx.closePath(); }
+                if(selection.isSelecting || selection.isDragging) handleSelectionEnd();
+
+                isPanning = true;
+                let pts = Array.from(activePointers.values());
+                lastPanX = (pts[0].x + pts[1].x) / 2;
+                lastPanY = (pts[0].y + pts[1].y) / 2;
+                e.preventDefault();
+                return;
+            }
+
+            // 單指模式
+            if (activePointers.size === 1 && (e.button === 0 || e.pointerType === 'touch')) {
+                if (currentMode === 'pen' || currentMode === 'eraser') {
+                    if (selection.active) stampSelection();
+                    isDrawing = true;
+                    ctx.beginPath();
+                    ctx.moveTo(e.clientX, e.clientY + window.scrollY); 
+                } else if (currentMode === 'move') {
+                    handleSelectionStart(e);
+                }
+            }
+        });
+
+        canvas.addEventListener('pointermove', function(e) {
+            if (activePointers.has(e.pointerId)) {
+                activePointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+            }
+
+            // 處理兩指滾動
+            if (activePointers.size === 2 && isPanning) {
+                let pts = Array.from(activePointers.values());
+                let midX = (pts[0].x + pts[1].x) / 2;
+                let midY = (pts[0].y + pts[1].y) / 2;
+                
+                let dx = lastPanX - midX;
+                let dy = lastPanY - midY;
+                
+                window.scrollBy(dx, dy); 
+                
+                lastPanX = midX;
+                lastPanY = midY;
+                e.preventDefault();
+                return;
+            }
+
+            // 處理單指畫圖與框選
+            if (activePointers.size === 1) {
+                if (currentMode === 'pen' || currentMode === 'eraser') {
+                    if (!isDrawing) return;
+                    ctx.lineTo(e.clientX, e.clientY + window.scrollY); 
+                    
+                    if (currentMode === 'eraser') {
+                        ctx.globalCompositeOperation = 'destination-out';
+                        ctx.lineWidth = 40;
+                    } else {
+                        ctx.globalCompositeOperation = 'source-over';
+                        ctx.strokeStyle = currentColor;
+                        ctx.lineWidth = 4;
+                    }
+                    ctx.stroke();
+                } else if (currentMode === 'move') {
+                    handleSelectionMove(e);
+                }
+            }
+        });
+
+        function stopDrawing() {
+            if (isDrawing) { ctx.closePath(); isDrawing = false; saveState(); } 
+            else if (selection.isSelecting || selection.isDragging) { handleSelectionEnd(); }
+        }
+
+        function removePointer(e) {
+            activePointers.delete(e.pointerId);
+            if (activePointers.size < 2) isPanning = false;
+            if (activePointers.size === 0) stopDrawing();
+        }
+
+        canvas.addEventListener('pointerup', removePointer);
+        canvas.addEventListener('pointercancel', removePointer);
+        canvas.addEventListener('pointerout', removePointer);
+
+        function handleSelectionStart(e) {
+            const mouseX = e.clientX;
+            const mouseY = e.clientY + window.scrollY;
+
+            if (selection.active && mouseX >= selection.x && mouseX <= selection.x + selection.w && mouseY >= selection.y && mouseY <= selection.y + selection.h) {
+                selection.isDragging = true;
+                selection.startX = mouseX - selection.x; selection.startY = mouseY - selection.y;
+            } else {
+                if (selection.active) stampSelection();
+                selection.isSelecting = true;
+                selection.startX = mouseX; selection.startY = mouseY;
+                selection.x = mouseX; selection.y = mouseY; selection.w = 0; selection.h = 0;
+            }
+        }
+
+        function handleSelectionMove(e) {
+            if (selection.isSelecting) {
+                selection.w = e.clientX - selection.startX;
+                selection.h = (e.clientY + window.scrollY) - selection.startY;
+                uiCtx.clearRect(0, 0, uiCanvas.width, uiCanvas.height);
+                drawDashedRect(selection.startX, selection.startY, selection.w, selection.h);
+            } else if (selection.isDragging) {
+                selection.x = e.clientX - selection.startX;
+                selection.y = (e.clientY + window.scrollY) - selection.startY;
+                uiCtx.clearRect(0, 0, uiCanvas.width, uiCanvas.height);
+                uiCtx.drawImage(selection.tempCanvas, selection.x, selection.y);
+                drawDashedRect(selection.x, selection.y, selection.w, selection.h);
+            }
+        }
+
+        function handleSelectionEnd() {
+            if (selection.isSelecting) {
+                selection.isSelecting = false;
+                let sx = selection.w < 0 ? selection.startX + selection.w : selection.startX;
+                let sy = selection.h < 0 ? selection.startY + selection.h : selection.startY;
+                let sw = Math.abs(selection.w);
+                let sh = Math.abs(selection.h);
+                
+                if (sw > 5 && sh > 5) {
+                    selection.x = sx; selection.y = sy; selection.w = sw; selection.h = sh;
+                    const imgData = ctx.getImageData(sx, sy, sw, sh);
+                    selection.tempCanvas = document.createElement('canvas');
+                    selection.tempCanvas.width = sw; selection.tempCanvas.height = sh;
+                    selection.tempCanvas.getContext('2d').putImageData(imgData, 0, 0);
+                    
+                    ctx.clearRect(sx, sy, sw, sh);
+                    saveState();
+                    
+                    uiCtx.clearRect(0, 0, uiCanvas.width, uiCanvas.height);
+                    uiCtx.drawImage(selection.tempCanvas, sx, sy);
+                    drawDashedRect(sx, sy, sw, sh);
+                    selection.active = true;
+                } else {
+                    uiCtx.clearRect(0, 0, uiCanvas.width, uiCanvas.height);
+                }
+            } else if (selection.isDragging) {
+                selection.isDragging = false;
+            }
+        }
+
+        function stampSelection() {
+            if (!selection.active) return;
+            ctx.drawImage(selection.tempCanvas, selection.x, selection.y);
+            uiCtx.clearRect(0, 0, uiCanvas.width, uiCanvas.height);
+            selection.active = false; selection.tempCanvas = null;
+            saveState();
+        }
+
+        function drawDashedRect(x, y, w, h) {
+            uiCtx.save();
+            uiCtx.setLineDash([5, 5]);
+            uiCtx.strokeStyle = 'black'; uiCtx.lineWidth = 2; uiCtx.strokeRect(x, y, w, h);
+            uiCtx.strokeStyle = 'white'; uiCtx.lineDashOffset = 5; uiCtx.strokeRect(x, y, w, h);
+            uiCtx.restore();
+        }
+
+        document.getElementById('tool-panel').onpointerdown = function(e) { e.stopPropagation(); };
+
+        function setToolActive(toolId) {
+            if (selection.active) stampSelection();
+            document.getElementById('btn-pen').classList.remove('active');
+            document.getElementById('btn-eraser').classList.remove('active');
+            document.getElementById('btn-move').classList.remove('active');
+            if(toolId) document.getElementById(toolId).classList.add('active');
+        }
+
+        document.getElementById('btn-pen').onpointerdown = function(e) { e.stopPropagation(); currentMode = 'pen'; setToolActive('btn-pen'); };
+        document.getElementById('btn-eraser').onpointerdown = function(e) { e.stopPropagation(); currentMode = 'eraser'; setToolActive('btn-eraser'); };
+        document.getElementById('btn-move').onpointerdown = function(e) { e.stopPropagation(); currentMode = 'move'; setToolActive('btn-move'); };
+
+        document.getElementById('btn-extend-down').onpointerdown = function(e) {
+            e.stopPropagation();
+            if (selection.active) stampSelection(); 
+
+            const oldCanvasData = canvas.toDataURL();
+            const extensionHeight = 800; 
+            
+            canvas.height += extensionHeight;
+            uiCanvas.height += extensionHeight;
+            ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+            
+            const img = new Image();
+            img.onload = () => {
+                ctx.drawImage(img, 0, 0); 
+                saveState(); 
+                window.scrollBy({ top: 300, behavior: 'smooth' });
+            };
+            img.src = oldCanvasData;
+        };
+
+        document.getElementById('btn-extend-up').onpointerdown = function(e) {
+            e.stopPropagation();
+            if (selection.active) stampSelection(); 
+
+            const oldCanvasData = canvas.toDataURL();
+            const extensionHeight = 800; 
+            
+            canvas.height += extensionHeight;
+            uiCanvas.height += extensionHeight;
+            ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+            
+            bgOffsetY += extensionHeight;
+            bgImg.style.top = bgOffsetY + 'px';
+            
+            const img = new Image();
+            img.onload = () => {
+                ctx.drawImage(img, 0, extensionHeight); 
+                saveState(); 
+                window.scrollBy(0, extensionHeight); 
+                setTimeout(() => window.scrollBy({ top: -300, behavior: 'smooth' }), 50);
+            };
+            img.src = oldCanvasData;
+        };
+
+        document.getElementById('btn-clear').onpointerdown = function(e) {
+            e.stopPropagation();
+            if(confirm('確定要清除黑板上的所有筆跡嗎？')) {
+                if (selection.active) { selection.active = false; uiCtx.clearRect(0,0,uiCanvas.width,uiCanvas.height); }
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                bgOffsetY = 0;
+                bgImg.style.top = '0px';
+                localStorage.removeItem(storageKey);
+                saveState();
+            }
+        };
+
+        document.getElementById('btn-save').onpointerdown = function(e) {
+            e.stopPropagation();
+            if (selection.active) stampSelection(); 
+            saveCanvas();
+            alert('本班筆跡已儲存！');
+        };
+
+        function saveCanvas() {
+            try { 
+                const saveData = JSON.stringify({
+                    img: canvas.toDataURL(),
+                    bgOffset: bgOffsetY
+                });
+                localStorage.setItem(storageKey, saveData); 
+            } catch (err) { console.error(err); }
+        }
+
+        function loadCanvas() {
+            try {
+                const savedData = localStorage.getItem(storageKey);
+                if (savedData) {
+                    let dataUrl = savedData;
+                    if (savedData.startsWith('{')) {
+                        const parsed = JSON.parse(savedData);
+                        dataUrl = parsed.img;
+                        bgOffsetY = parsed.bgOffset || 0;
+                        bgImg.style.top = bgOffsetY + 'px';
+                    }
+
+                    const img = new Image();
+                    img.onload = () => {
+                        if(img.height > canvas.height) {
+                            canvas.height = img.height;
+                            uiCanvas.height = img.height;
+                            ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+                        }
+                        ctx.clearRect(0, 0, canvas.width, canvas.height);
+                        ctx.drawImage(img, 0, 0);
+                        setTimeout(() => { undoStack = [canvas.toDataURL()]; undoIndex = 0; }, 100); 
+                    };
+                    img.src = dataUrl;
+                } else {
+                    saveState(); 
+                }
+            } catch (err) { console.error(err); }
+        }
+
+        document.querySelectorAll('.color-btn').forEach(function(btn) {
+            btn.onpointerdown = function(e) {
+                e.stopPropagation();
+                currentColor = this.getAttribute('data-color');
+                currentMode = 'pen';
+                document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('active'));
+                this.classList.add('active');
+                setToolActive('btn-pen');
+            };
+        });
+    </script>
+</body>
+</html>
